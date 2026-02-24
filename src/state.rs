@@ -291,24 +291,37 @@ impl TreeState {
     }
 
     /// Select the currently highlighted RadioItem, deselecting its siblings.
-    pub fn select_radio(&mut self) {
+    /// Returns `true` if the selection actually changed.
+    pub fn select_radio(&mut self) -> bool {
         let visible = self.visible_nodes();
         let Some(vn) = visible.get(self.selected) else {
-            return;
+            return false;
         };
+        let already_selected = matches!(vn.node.kind, NodeKind::RadioItem { selected: true, .. });
         if !matches!(vn.node.kind, NodeKind::RadioItem { .. }) {
-            return;
+            return false;
         }
         let path = vn.path.clone();
         let variant_name = vn.node.key.clone();
         drop(visible);
 
+        if already_selected {
+            // Already selected — just toggle expand/collapse
+            self.toggle_expand();
+            return false;
+        }
+
         // Find the parent RadioGroup path
         if let Some(dot) = path.rfind('.') {
             let parent_path = &path[..dot];
             let parts: Vec<&str> = parent_path.split('.').collect();
-            select_radio_in_nodes(&mut self.nodes, &parts, &variant_name);
+            select_radio_in_nodes(&mut self.nodes, &parts, &variant_name, &self.defs.clone());
+
+            // Auto-expand the selected struct variant's path
+            let selected_path = format!("{}.{}", parent_path, variant_name);
+            self.expanded.insert(selected_path);
         }
+        true
     }
 
     pub fn toggle_option(&mut self) {
@@ -418,6 +431,10 @@ fn collect_expanded_paths(nodes: &[ConfigNode], prefix: &mut String, expanded: &
                 expanded.insert(path.clone());
                 collect_expanded_paths(&node.children, &mut path.clone(), expanded);
             }
+            NodeKind::RadioItem { selected: true, is_struct: true } if !node.children.is_empty() => {
+                expanded.insert(path.clone());
+                collect_expanded_paths(&node.children, &mut path.clone(), expanded);
+            }
             _ => {}
         }
     }
@@ -503,7 +520,13 @@ fn set_option_state_in_nodes(
 
 /// Select `variant_name` in a RadioGroup at the given path,
 /// deselecting all other siblings and updating the parent value.
-fn select_radio_in_nodes(nodes: &mut [ConfigNode], path_parts: &[&str], variant_name: &str) {
+/// For struct variants, builds field children from schema defaults.
+fn select_radio_in_nodes(
+    nodes: &mut [ConfigNode],
+    path_parts: &[&str],
+    variant_name: &str,
+    defs: &Map<String, Value>,
+) {
     let Some((&first, rest)) = path_parts.split_first() else {
         return;
     };
@@ -511,17 +534,53 @@ fn select_radio_in_nodes(nodes: &mut [ConfigNode], path_parts: &[&str], variant_
         if node.key == first {
             if rest.is_empty() {
                 // This is the RadioGroup node — update children and value
+                let child_depth = node.depth + 1;
                 for child in &mut node.children {
-                    if let NodeKind::RadioItem { selected: ref mut s } = child.kind {
+                    if let NodeKind::RadioItem { selected: ref mut s, is_struct } = child.kind {
                         let is_match = child.key == variant_name;
                         *s = is_match;
                         child.value = Value::Bool(is_match);
+
+                        if is_struct {
+                            if is_match {
+                                // Build field children from the variant's schema defaults
+                                if let Some(ref schema) = child.inner_schema {
+                                    let default_val = default_value_for_schema(schema, defs);
+                                    if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
+                                        child.children = crate::node::build_tree_from_properties(
+                                            props,
+                                            schema,
+                                            defs,
+                                            default_val.as_object(),
+                                            child_depth + 1,
+                                        );
+                                    }
+                                }
+                            } else {
+                                // Clear children for deselected struct variants
+                                child.children.clear();
+                            }
+                        }
                     }
                 }
-                node.value = Value::String(variant_name.to_string());
+
+                // Update the RadioGroup value: unit → "Name", struct → {"Name": {defaults}}
+                let selected_child = node.children.iter().find(|c| c.key == variant_name);
+                if let Some(child) = selected_child {
+                    if let NodeKind::RadioItem { is_struct: true, .. } = &child.kind {
+                        if let Some(ref schema) = child.inner_schema {
+                            let default_val = default_value_for_schema(schema, defs);
+                            let mut obj = Map::new();
+                            obj.insert(variant_name.to_string(), default_val);
+                            node.value = Value::Object(obj);
+                        }
+                    } else {
+                        node.value = Value::String(variant_name.to_string());
+                    }
+                }
                 return;
             } else {
-                select_radio_in_nodes(&mut node.children, rest, variant_name);
+                select_radio_in_nodes(&mut node.children, rest, variant_name, defs);
                 return;
             }
         }
@@ -591,14 +650,7 @@ fn nodes_to_value(nodes: &[ConfigNode]) -> Value {
                     Value::Null
                 }
             }
-            NodeKind::RadioGroup { .. } => {
-                // The selected variant's key is the value
-                node.children
-                    .iter()
-                    .find(|c| matches!(c.kind, NodeKind::RadioItem { selected: true }))
-                    .map(|c| Value::String(c.key.clone()))
-                    .unwrap_or(node.value.clone())
-            }
+            NodeKind::RadioGroup { .. } => radio_group_to_value(node),
             NodeKind::Checkboxes { .. } => Value::Array(
                 node.children
                     .iter()
@@ -613,14 +665,30 @@ fn nodes_to_value(nodes: &[ConfigNode]) -> Value {
     Value::Object(map)
 }
 
+/// Serialize a RadioGroup node to its JSON value.
+/// Unit variants produce `"VariantName"`.
+/// Struct variants produce `{"VariantName": {field_values...}}`.
+fn radio_group_to_value(node: &ConfigNode) -> Value {
+    let selected = node
+        .children
+        .iter()
+        .find(|c| matches!(c.kind, NodeKind::RadioItem { selected: true, .. }));
+    match selected {
+        Some(child) => match &child.kind {
+            NodeKind::RadioItem { is_struct: true, .. } if !child.children.is_empty() => {
+                let mut obj = Map::new();
+                obj.insert(child.key.clone(), nodes_to_value(&child.children));
+                Value::Object(obj)
+            }
+            _ => Value::String(child.key.clone()),
+        },
+        None => node.value.clone(),
+    }
+}
+
 fn node_to_value(node: &ConfigNode) -> Value {
     match &node.kind {
-        NodeKind::RadioGroup { .. } => node
-            .children
-            .iter()
-            .find(|c| matches!(c.kind, NodeKind::RadioItem { selected: true }))
-            .map(|c| Value::String(c.key.clone()))
-            .unwrap_or(node.value.clone()),
+        NodeKind::RadioGroup { .. } => radio_group_to_value(node),
         NodeKind::Checkboxes { .. } => Value::Array(
             node.children
                 .iter()

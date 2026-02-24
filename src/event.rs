@@ -101,9 +101,9 @@ fn handle_normal_key(state: &mut TreeState, event: KeyEvent) -> EventResult {
                     }
                 }
                 NodeKind::RadioItem { .. } => {
-                    state.select_radio();
+                    let changed = state.select_radio();
                     EventResult::Consumed {
-                        value_changed: true,
+                        value_changed: changed,
                     }
                 }
                 NodeKind::CheckboxItem { .. } => {
@@ -147,9 +147,9 @@ fn handle_normal_key(state: &mut TreeState, event: KeyEvent) -> EventResult {
                     }
                 }
                 NodeKind::RadioItem { .. } => {
-                    state.select_radio();
+                    let changed = state.select_radio();
                     EventResult::Consumed {
-                        value_changed: true,
+                        value_changed: changed,
                     }
                 }
                 NodeKind::CheckboxItem { .. } => {

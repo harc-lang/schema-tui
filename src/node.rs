@@ -18,7 +18,9 @@ pub enum NodeKind {
     /// Children are `RadioItem` nodes; exactly one is selected.
     RadioGroup { variants: Vec<std::string::String> },
     /// A single item inside a `RadioGroup` container.
-    RadioItem { selected: bool },
+    /// `is_struct` is true for externally-tagged enum variants that carry
+    /// struct data (children hold the variant's fields when selected).
+    RadioItem { selected: bool, is_struct: bool },
     /// A `Vec<UnitEnum>` displayed as non-exclusive checkboxes.
     /// Children are `CheckboxItem` nodes.
     Checkboxes { variants: Vec<std::string::String> },
@@ -431,7 +433,16 @@ fn extract_enum_variants(schema: &Value) -> Option<Vec<std::string::String>> {
     None
 }
 
-/// Build a RadioGroup container with RadioItem children for unit enums.
+/// Describes one variant of an externally-tagged enum.
+#[derive(Clone)]
+struct VariantInfo {
+    name: std::string::String,
+    /// `None` for unit variants, `Some(schema)` for struct variants.
+    inner_schema: Option<Value>,
+}
+
+/// Build a RadioGroup container with RadioItem children for enums
+/// (both pure-unit and mixed unit/struct variants).
 fn try_build_enum(
     key: &str,
     resolved: &Value,
@@ -440,28 +451,59 @@ fn try_build_enum(
     depth: usize,
     description: Option<std::string::String>,
 ) -> Option<ConfigNode> {
-    let variants = extract_enum_variants_from_schema(resolved, defs)?;
-    let current = value.as_str().unwrap_or("");
+    let variant_infos = extract_variant_infos(resolved, defs)?;
 
-    let children: Vec<ConfigNode> = variants
+    // Determine which variant is currently selected and get its inner value.
+    // Unit variant: value is `"Sod"` → current_name = "Sod", inner_value = None
+    // Struct variant: value is `{"SodCustom": {"n": 100}}` → current_name = "SodCustom",
+    //   inner_value = Some({"n": 100})
+    let (current_name, current_inner_value) = match value {
+        Value::String(s) => (s.as_str().to_string(), None),
+        Value::Object(obj) if obj.len() == 1 => {
+            let (k, v) = obj.iter().next().unwrap();
+            (k.clone(), Some(v.clone()))
+        }
+        _ => (std::string::String::new(), None),
+    };
+
+    let variants: Vec<std::string::String> =
+        variant_infos.iter().map(|vi| vi.name.clone()).collect();
+
+    let children: Vec<ConfigNode> = variant_infos
         .iter()
-        .map(|variant| {
-            let is_selected = variant == current;
+        .map(|vi| {
+            let is_selected = vi.name == current_name;
+            let is_struct = vi.inner_schema.is_some();
+
+            // For a selected struct variant, build its field children from
+            // the current value (or defaults if unavailable).
+            let field_children = if is_selected && is_struct {
+                if let Some(ref schema_val) = vi.inner_schema {
+                    let resolved_inner = resolve_schema(schema_val, defs);
+                    let inner_val = current_inner_value.as_ref().unwrap_or(&Value::Null);
+                    build_struct_variant_children(resolved_inner, inner_val, defs, depth + 2)
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+
             ConfigNode {
-                key: variant.clone(),
-                kind: NodeKind::RadioItem { selected: is_selected },
+                key: vi.name.clone(),
+                kind: NodeKind::RadioItem { selected: is_selected, is_struct },
                 value: Value::Bool(is_selected),
-                children: Vec::new(),
+                children: field_children,
                 depth: depth + 1,
                 description: None,
-                inner_schema: None,
+                inner_schema: vi.inner_schema.clone(),
             }
         })
         .collect();
 
     Some(ConfigNode {
         key: key.to_string(),
-        kind: NodeKind::RadioGroup { variants: variants.clone() },
+        kind: NodeKind::RadioGroup { variants },
         value: value.clone(),
         children,
         depth,
@@ -470,53 +512,72 @@ fn try_build_enum(
     })
 }
 
-/// Extract enum variants from a schema, trying all known patterns.
-fn extract_enum_variants_from_schema(
+/// Build the field children for a selected struct variant.
+fn build_struct_variant_children(
+    resolved_schema: &Value,
+    value: &Value,
+    defs: &Map<std::string::String, Value>,
+    depth: usize,
+) -> Vec<ConfigNode> {
+    if let Some(props) = resolved_schema.get("properties").and_then(|v| v.as_object()) {
+        build_children(props, resolved_schema, defs, value.as_object(), depth)
+    } else {
+        Vec::new()
+    }
+}
+
+/// Extract per-variant information from an enum schema.
+/// Returns `None` if the schema is not an enum.
+fn extract_variant_infos(
     resolved: &Value,
     defs: &Map<std::string::String, Value>,
-) -> Option<Vec<std::string::String>> {
-    // Pattern 1: "oneOf" with "const" values (schemars 1.x unit enums)
+) -> Option<Vec<VariantInfo>> {
+    // Pattern 1: "oneOf" array
     if let Some(one_of) = resolved.get("oneOf").and_then(|v| v.as_array()) {
-        let variants: Vec<std::string::String> = one_of
-            .iter()
-            .filter_map(|v| {
-                v.get("const")
-                    .and_then(|c| c.as_str())
-                    .map(|s| s.to_string())
-            })
-            .collect();
-        if !variants.is_empty() {
-            return Some(variants);
-        }
+        let mut infos = Vec::new();
+        for entry in one_of {
+            let resolved_entry = resolve_schema(entry, defs);
 
-        // Externally-tagged enum variants (complex enums)
-        let variants: Vec<std::string::String> = one_of
-            .iter()
-            .filter_map(|v| {
-                let resolved_v = resolve_schema(v, defs);
-                if let Some(props) = resolved_v.get("properties").and_then(|p| p.as_object())
-                    && props.len() == 1 {
-                        return props.keys().next().map(|k| k.to_string());
+            // Unit variant: {"const": "Sod"} or {"enum": ["Sod"], "type": "string"}
+            if let Some(c) = resolved_entry.get("const").and_then(|c| c.as_str()) {
+                infos.push(VariantInfo { name: c.to_string(), inner_schema: None });
+                continue;
+            }
+            if let Some(enum_arr) = resolved_entry.get("enum").and_then(|v| v.as_array()) {
+                for ev in enum_arr {
+                    if let Some(s) = ev.as_str() {
+                        infos.push(VariantInfo { name: s.to_string(), inner_schema: None });
                     }
-                resolved_v
-                    .get("const")
-                    .and_then(|c| c.as_str())
-                    .map(|s| s.to_string())
-            })
-            .collect();
-        if !variants.is_empty() {
-            return Some(variants);
+                }
+                continue;
+            }
+
+            // Struct variant: {"properties": {"SodCustom": {inner_schema}}, "type": "object"}
+            if let Some(props) = resolved_entry.get("properties").and_then(|p| p.as_object())
+                && props.len() == 1
+            {
+                let (variant_name, variant_schema) = props.iter().next().unwrap();
+                let resolved_variant = resolve_schema(variant_schema, defs);
+                infos.push(VariantInfo {
+                    name: variant_name.clone(),
+                    inner_schema: Some(resolved_variant.clone()),
+                });
+                continue;
+            }
+        }
+        if !infos.is_empty() {
+            return Some(infos);
         }
     }
 
-    // Pattern 2: "enum" array of strings
+    // Pattern 2: "enum" array of strings (pure unit enum)
     if let Some(enum_values) = resolved.get("enum").and_then(|v| v.as_array()) {
-        let variants: Vec<std::string::String> = enum_values
+        let infos: Vec<VariantInfo> = enum_values
             .iter()
-            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .filter_map(|v| v.as_str().map(|s| VariantInfo { name: s.to_string(), inner_schema: None }))
             .collect();
-        if !variants.is_empty() {
-            return Some(variants);
+        if !infos.is_empty() {
+            return Some(infos);
         }
     }
 
@@ -550,6 +611,11 @@ pub fn default_value_for_schema(
     defs: &Map<std::string::String, Value>,
 ) -> Value {
     let resolved = resolve_schema(schema, defs);
+
+    // If the schema specifies an explicit default, use it
+    if let Some(default) = resolved.get("default") {
+        return default.clone();
+    }
 
     // Check for anyOf (Option pattern) — default to null
     if resolved.get("anyOf").is_some() {

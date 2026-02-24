@@ -7,6 +7,8 @@ use crate::state::{EditMode, TreeState};
 pub struct SchemaTree<'a> {
     title: Option<&'a str>,
     border: bool,
+    border_style: Style,
+    show_help: bool,
     highlight_style: Style,
     key_style: Style,
     value_style: Style,
@@ -19,6 +21,8 @@ impl<'a> Default for SchemaTree<'a> {
         Self {
             title: None,
             border: true,
+            border_style: Style::default(),
+            show_help: true,
             highlight_style: Style::default().bg(Color::DarkGray),
             key_style: Style::default().fg(Color::Cyan),
             value_style: Style::default().fg(Color::White),
@@ -63,6 +67,16 @@ impl<'a> SchemaTree<'a> {
         self.disabled_style = style;
         self
     }
+
+    pub fn border_style(mut self, style: Style) -> Self {
+        self.border_style = style;
+        self
+    }
+
+    pub fn show_help(mut self, show: bool) -> Self {
+        self.show_help = show;
+        self
+    }
 }
 
 impl<'a> StatefulWidget for SchemaTree<'a> {
@@ -70,7 +84,9 @@ impl<'a> StatefulWidget for SchemaTree<'a> {
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut TreeState) {
         let inner = if self.border {
-            let mut block = Block::default().borders(Borders::ALL);
+            let mut block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(self.border_style);
             if let Some(t) = self.title {
                 block = block.title(t);
             }
@@ -97,8 +113,8 @@ impl<'a> StatefulWidget for SchemaTree<'a> {
 
         let visible = state.visible_nodes();
 
-        // Render help line at bottom if there's room
-        let (tree_height, help_area) = if inner.height >= 3 {
+        // Render help line at bottom if there's room and it's enabled
+        let (tree_height, help_area) = if self.show_help && inner.height >= 3 {
             (
                 inner.height - 1,
                 Some(Rect {
@@ -155,10 +171,19 @@ impl<'a> StatefulWidget for SchemaTree<'a> {
                     render_str(buf, x, y, max_x, &node.key, ks);
                     continue;
                 }
-                NodeKind::RadioItem { selected } => {
+                NodeKind::RadioItem { selected, is_struct } => {
                     let indicator = if *selected { "● " } else { "○ " };
                     x = render_str(buf, x, y, max_x, indicator, vs);
-                    render_str(buf, x, y, max_x, &node.key, ks);
+                    x = render_str(buf, x, y, max_x, &node.key, ks);
+                    // Show expand/collapse marker for selected struct variants
+                    if *is_struct && *selected && !node.children.is_empty() {
+                        let marker = if state.expanded.contains(&vn.path) {
+                            " ▼"
+                        } else {
+                            " ▶"
+                        };
+                        render_str(buf, x, y, max_x, marker, ks);
+                    }
                     continue;
                 }
                 NodeKind::CheckboxItem { checked } => {
@@ -294,7 +319,7 @@ fn format_value(node: &crate::node::ConfigNode) -> String {
             // Show the currently selected variant
             node.children
                 .iter()
-                .find(|c| matches!(c.kind, NodeKind::RadioItem { selected: true }))
+                .find(|c| matches!(c.kind, NodeKind::RadioItem { selected: true, .. }))
                 .map(|c| c.key.clone())
                 .unwrap_or_else(|| "?".to_string())
         }
