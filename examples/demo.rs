@@ -2,9 +2,9 @@ use std::io;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::{DefaultTerminal, Frame};
+use schema_tui::{EditMode, NodeFilter, SchemaTree, TreeState, handle_key_event};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use term_schema::{handle_key_event, EditMode, NodeFilter, SchemaTree, TreeState};
 
 #[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
 struct AppConfig {
@@ -83,7 +83,10 @@ struct DemoFilter;
 
 impl NodeFilter for DemoFilter {
     fn enabled(&self, path: &str) -> bool {
-        !matches!(path, "app_name" | "experimental" | "mode.Debug" | "mode.Release" | "mode.Test")
+        !matches!(
+            path,
+            "app_name" | "experimental" | "mode.Debug" | "mode.Release" | "mode.Test"
+        )
     }
 }
 
@@ -140,7 +143,8 @@ fn main() -> io::Result<()> {
 fn run(terminal: &mut DefaultTerminal, state: &mut TreeState) -> io::Result<bool> {
     loop {
         terminal.draw(|frame: &mut Frame| {
-            let widget = SchemaTree::default().title(" Config Editor (q: save & quit, Ctrl+C: cancel) ");
+            let widget =
+                SchemaTree::default().title(" Config Editor (q: save & quit, Ctrl+C: cancel) ");
             frame.render_stateful_widget(widget, frame.area(), state);
 
             // Show cursor in edit mode
