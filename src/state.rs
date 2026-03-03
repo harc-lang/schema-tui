@@ -122,11 +122,20 @@ impl TreeState {
 
     pub fn expand_selected(&mut self) {
         let visible = self.visible_nodes();
-        if let Some(vn) = visible.get(self.selected)
-            && !vn.node.children.is_empty() {
+        if let Some(vn) = visible.get(self.selected) {
+            let is_expandable = !vn.node.children.is_empty()
+                || matches!(
+                    vn.node.kind,
+                    NodeKind::Struct { .. }
+                        | NodeKind::Option { is_some: true, .. }
+                        | NodeKind::RadioGroup { .. }
+                        | NodeKind::Checkboxes { .. }
+                );
+            if is_expandable {
                 let path = vn.path.clone();
                 self.expanded.insert(path);
             }
+        }
     }
 
     pub fn collapse_selected(&mut self) {
